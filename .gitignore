@@ -1,0 +1,16 @@
+# 运行时生成的本地数据，包含 Bambu token / WiFi 密码等隐私，切勿提交
+data/
+server-state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
