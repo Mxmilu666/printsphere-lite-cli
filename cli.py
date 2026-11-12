@@ -4,17 +4,22 @@
 PrintSphere Lite CLI
 """
 
-import base64
 import json
-import os
 import re
-import socket
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from profiles import (
+    BACKEND_VERSION, DEFAULT_CONFIG, CONFIG_FILE, DEVICES_FILE, HISTORY_FILE,
+    ensure_data, read_json, write_json, merge_config, read_config, save_config,
+    normalize_brightness, normalize_layout, normalize_alias, normalize_serial_port,
+    normalize_esp_host, esp_id_from_status, esp_label, ensure_esp_profiles,
+    ensure_active_esp_selected, apply_status_to_config, activate_esp_profile,
+)
+from platform_support import render_alias_bitmap, local_lan_prefixes, list_pc_wifi_networks
 
 try:
     import serial  # pyserial
@@ -26,153 +31,10 @@ except ImportError:  # 友好提示
     sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
-# 常量与默认配置
-# ---------------------------------------------------------------------------
-
-BACKEND_VERSION = "cli-v0.4.57-printer-sync"
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
-DEVICES_FILE = os.path.join(DATA_DIR, "devices.json")
-
-DEFAULT_SERIAL_PORT = "COM4" if os.name == "nt" else ""
-
-DEFAULT_CONFIG = {
-    "wifi": {"ssid": "", "password": ""},
-    "cloud": {
-        "region": "cn",
-        "account": "",
-        "access_token": "",
-        "mqtt_username": "",
-        "token_expires_at": 0,
-    },
-    "printer": {"serial": "", "access_code": "", "display_name": "", "model": ""},
-    "display": {"brightness": 100, "active_brightness": 100, "dimmed": False},
-    "esp": {
-        "host": "",
-        "port": 8081,
-        "serial_port": DEFAULT_SERIAL_PORT,
-        "wifi_status": "unknown",
-        "last_ip": "",
-        "last_checked_at": 0,
-        "last_error": "",
-    },
-}
 
 # 串口操作串行化，避免多个动作同时抢占 COM 口
 _serial_lock = threading.Lock()
-
-
-# ---------------------------------------------------------------------------
-# 通用小工具
-# ---------------------------------------------------------------------------
-
-def ensure_data():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(CONFIG_FILE):
-        write_json(CONFIG_FILE, DEFAULT_CONFIG)
-    if not os.path.exists(DEVICES_FILE):
-        write_json(DEVICES_FILE, {"updated_at": 0, "devices": []})
-
-
-def merge_config(base, extra):
-    """深合并：extra 覆盖 base，对象递归合并。"""
-    out = json.loads(json.dumps(base))
-    for key, value in (extra or {}).items():
-        if isinstance(value, dict):
-            out[key] = merge_config(out.get(key) or {}, value)
-        else:
-            out[key] = value
-    return out
-
-
-def read_json(path, fallback):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.loads(fh.read().lstrip("﻿"))
-    except Exception:
-        return fallback
-
-
-def write_json(path, value):
-    text = json.dumps(value, ensure_ascii=False, indent=2)
-    tmp = "{}.{}.{}.tmp".format(path, os.getpid(), int(time.time() * 1000))
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    try:
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-
-
-def normalize_brightness(value):
-    try:
-        level = float(value)
-    except (TypeError, ValueError):
-        return 100
-    if level <= 25:
-        return 25
-    if level <= 50:
-        return 50
-    if level <= 75:
-        return 75
-    return 100
-
-
-def normalize_serial_port(port):
-    raw = str(port or "").strip()
-    if not raw:
-        return DEFAULT_SERIAL_PORT
-    if re.match(r"^com\d+$", raw, re.IGNORECASE):
-        return raw.upper()
-    return raw  # 非 Windows 端口名（/dev/ttyUSB0 等）原样保留
-
-
-def is_private_ipv4(address):
-    parts = str(address or "").split(".")
-    if len(parts) != 4:
-        return False
-    try:
-        nums = [int(p) for p in parts]
-    except ValueError:
-        return False
-    if any(n < 0 or n > 255 for n in nums):
-        return False
-    return (
-        nums[0] == 10
-        or (nums[0] == 172 and 16 <= nums[1] <= 31)
-        or (nums[0] == 192 and nums[1] == 168)
-    )
-
-
-def normalize_esp_host(host):
-    value = str(host or "").strip()
-    if not value or re.match(r"^\(.*\)$", value):
-        return ""
-    value = re.sub(r"^https?://", "", value, flags=re.IGNORECASE)
-    value = value.split("/")[0].split("?")[0].strip()
-    if "@" in value:
-        value = value.split("@")[-1]
-    if value.startswith("[") and "]" in value:
-        value = value[1:value.index("]")]
-    elif value.count(":") == 1:
-        value = value.split(":")[0]
-    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", value):
-        return value if is_private_ipv4(value) else ""
-    if re.match(r"^[a-z0-9.-]+$", value, re.IGNORECASE) and "." in value:
-        return value
-    return ""
+_local_http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def find_deep(value, keys):
@@ -192,31 +54,6 @@ def find_deep(value, keys):
             if found:
                 return found
     return ""
-
-
-# ---------------------------------------------------------------------------
-# 配置读写（单 ESP 模型：CLI 每次只配置一台 ESP）
-# ---------------------------------------------------------------------------
-
-def read_config():
-    cfg = merge_config(DEFAULT_CONFIG, read_json(CONFIG_FILE, DEFAULT_CONFIG))
-    if not cfg["esp"]["port"] or int(cfg["esp"]["port"]) in (80, 8080):
-        cfg["esp"]["port"] = 8081
-    cfg["esp"]["serial_port"] = normalize_serial_port(cfg["esp"]["serial_port"])
-    cfg["esp"]["host"] = normalize_esp_host(cfg["esp"]["host"])
-    cfg["esp"]["last_ip"] = normalize_esp_host(cfg["esp"]["last_ip"])
-    cfg["display"]["brightness"] = normalize_brightness(cfg["display"]["brightness"])
-    return cfg
-
-
-def save_config(next_cfg):
-    cfg = merge_config(DEFAULT_CONFIG, next_cfg)
-    cfg["esp"]["serial_port"] = normalize_serial_port(cfg["esp"]["serial_port"])
-    cfg["esp"]["host"] = normalize_esp_host(cfg["esp"]["host"])
-    cfg["esp"]["last_ip"] = normalize_esp_host(cfg["esp"]["last_ip"])
-    cfg["display"]["brightness"] = normalize_brightness(cfg["display"]["brightness"])
-    write_json(CONFIG_FILE, cfg)
-    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -405,18 +242,22 @@ def normalize_model_name(model):
         return "P1P"
     if "P1S" in normalized or normalized == "C12":
         return "P1S"
-    if "P2S" in normalized:
+    if "P2S" in normalized or normalized == "N7V2":
         return "P2S"
     if "X2D" in normalized or normalized == "N6V2":
         return "X2D"
+    if normalized == "BLP001":
+        return "X1C"
+    if normalized == "C13":
+        return "X1E"
     if "H2DPRO" in normalized:
         return "H2D Pro"
-    if "H2D" in normalized:
-        return "H2D"
-    if "H2S" in normalized:
-        return "H2S"
-    if "H2C" in normalized:
+    if "H2C" in normalized or normalized == "O1C2V2":
         return "H2C"
+    if "H2D" in normalized or normalized == "O1D":
+        return "H2D"
+    if "H2S" in normalized or normalized == "O1S":
+        return "H2S"
     if "X1E" in normalized or normalized == "AP02":
         return "X1E"
     if "X1CARBON" in normalized or "X1C" in normalized or normalized == "AP05":
@@ -439,6 +280,7 @@ def normalize_device(dev):
         "access_code": str(dev.get("dev_access_code") or dev.get("access_code") or dev.get("lan_access_code") or "").strip(),
         "online": dev.get("online") is not False,
         "print_status": str(dev.get("print_status") or dev.get("status") or "").strip(),
+        "raw": dev,
     }
 
 
@@ -452,7 +294,13 @@ def fetch_bindings():
     raw = res.get("json") or {}
     devices = [normalize_device(d) for d in (raw.get("devices") or [])]
     devices = [d for d in devices if d["serial"]]
-    write_json(DEVICES_FILE, {"updated_at": int(time.time() * 1000), "devices": devices})
+    snapshot = {"updated_at": int(time.time() * 1000), "devices": devices}
+    write_json(DEVICES_FILE, snapshot)
+    with open(HISTORY_FILE, "a", encoding="utf-8") as history:
+        history.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
+    sync = sync_printer_list_to_esp(devices)
+    if not sync.get("ok") and not sync.get("skipped"):
+        print("! 打印机列表同步失败:", sync.get("serial_error") or sync.get("error"))
     return devices
 
 
@@ -481,7 +329,7 @@ def serial_json_command(port, payload_obj, marker="", timeout_ms=35000):
     打开后等待 1.2s 再发送，逐行读取直到超时。
     """
     port_name = normalize_serial_port(port)
-    payload = json.dumps(payload_obj)
+    payload = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":"))
     with _serial_lock:
         ser = None
         try:
@@ -507,22 +355,24 @@ def serial_json_command(port, payload_obj, marker="", timeout_ms=35000):
             ser.flush()
 
             deadline = time.monotonic() + timeout_ms / 1000.0
-            buffer = ""
+            buffer = b""
             while time.monotonic() < deadline:
-                chunk = ser.readline()
+                chunk = ser.read(ser.in_waiting or 1)
                 if not chunk:
                     continue
-                line = chunk.decode("utf-8", "replace").strip()
-                if not line:
-                    continue
-                if line.startswith("{") and (not marker or marker in line):
-                    try:
-                        parsed = json.loads(line)
-                    except ValueError as err:
-                        return {"ok": False, "port": port_name, "error": str(err), "text": line}
-                    return {"ok": True, "port": port_name, "json": parsed, "text": line}
-                buffer += line + "\n"
-            return {"ok": False, "port": port_name, "text": buffer, "error": "串口无响应"}
+                buffer += chunk
+                while b"\n" in buffer:
+                    raw_line, buffer = buffer.split(b"\n", 1)
+                    line = raw_line.decode("utf-8", "replace").strip()
+                    if line.startswith("{") and (not marker or marker in line):
+                        try:
+                            parsed = json.loads(line)
+                        except ValueError:
+                            continue
+                        return {"ok": True, "port": port_name, "json": parsed}
+                if len(buffer) > 65536:
+                    return {"ok": False, "port": port_name, "error": "串口响应过长"}
+            return {"ok": False, "port": port_name, "error": "串口无响应"}
         except Exception as err:
             return {"ok": False, "port": port_name, "error": str(err), "text": ""}
         finally:
@@ -540,7 +390,7 @@ def push_config_to_serial(port, payload):
         return {"status": 0, "error": result.get("error") or "ESP 未确认收到串口配置"}
     body = result.get("json")
     if not isinstance(body, dict) or body.get("ok") is not True:
-        return {"status": 0, "error": (body or {}).get("error") or "ESP 拒绝了串口配置"}
+        return {"status": 0, "error": body.get("error", "ESP 拒绝了串口配置") if isinstance(body, dict) else "ESP 返回了无效确认"}
     return {"status": 200, "json": body, "port": result["port"], "acknowledged": True}
 
 
@@ -555,7 +405,7 @@ def local_request(url, method="GET", body=None, timeout_ms=1500):
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=payload, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout_ms / 1000.0) as resp:
+        with _local_http.open(req, timeout=timeout_ms / 1000.0) as resp:
             text = resp.read().decode("utf-8", "replace")
             status = resp.getcode() or 0
     except urllib.error.HTTPError as err:
@@ -572,7 +422,7 @@ def local_request(url, method="GET", body=None, timeout_ms=1500):
 
 def esp_config_url(payload, cfg):
     from urllib.parse import urlencode
-    params = {k: str(v) for k, v in payload.items() if v not in (None, "") and len(str(v))}
+    params = {k: str(v) for k, v in payload.items() if v is not None}
     base = "http://{}:{}/api/config-url".format(cfg["esp"]["host"], int(cfg["esp"]["port"] or 8081))
     return base + "?" + urlencode(params)
 
@@ -592,47 +442,84 @@ def is_wifi_configured_status(body):
 # ESP 操作：身份检测、WiFi 扫描、写配置
 # ---------------------------------------------------------------------------
 
-def apply_status_to_config(status, serial_port, host=""):
-    """把串口/HTTP 读到的 ESP status 落进当前配置（单 ESP 模型）。"""
+
+
+def auto_detect_esp_ports():
+    before = read_config()
+    original = before["active_esp_id"]
+    ports = list_serial_ports()
+    results = []
+    for item in ports:
+        port = item["port"]
+        result = serial_json_command(port, {"cmd": "status"}, '"ok"', 6500)
+        body = result.get("json")
+        if result["ok"] and isinstance(body, dict) and body.get("ok") is True and esp_id_from_status(body) != "default":
+            cfg = apply_status_to_config(body, port)
+            results.append({"ok": True, "port": port, "id": cfg["active_esp_id"]})
+        else:
+            results.append({"ok": False, "port": port, "error": result.get("error") or "不是 PrintSphere ESP"})
     cfg = read_config()
-    cfg["esp"]["serial_port"] = normalize_serial_port(serial_port or cfg["esp"]["serial_port"])
-    cfg["esp"]["port"] = int(cfg["esp"]["port"] or 8081)
-    if host:
-        cfg["esp"]["host"] = normalize_esp_host(host)
-    if isinstance(status, dict):
-        if "ip" in status:
-            ip = normalize_esp_host(status.get("ip"))
-            cfg["esp"]["host"] = ip
-            cfg["esp"]["last_ip"] = ip
-        if "mqtt_connected" in status:
-            cfg["esp"]["last_error"] = ""
-        cfg["esp"]["wifi_status"] = (
-            "configured" if is_wifi_configured_status(status)
-            else ("ap_only" if status.get("ap_ssid") else cfg["esp"]["wifi_status"])
-        )
-        if status.get("serial"):
-            cfg["printer"]["serial"] = str(status["serial"])
-        if status.get("name"):
-            cfg["printer"]["display_name"] = str(status["name"])
-        if "brightness" in status:
-            cfg["display"]["brightness"] = normalize_brightness(status["brightness"])
-        if "brightness_active" in status:
-            cfg["display"]["active_brightness"] = normalize_brightness(status["brightness_active"])
-        if "brightness_dimmed" in status:
-            cfg["display"]["dimmed"] = bool(status["brightness_dimmed"])
-    cfg["esp"]["last_checked_at"] = int(time.time() * 1000)
-    save_config(cfg)
-    return cfg
+    detected = {r["port"]: r["id"] for r in results if r["ok"]}
+    connected = {p["port"] for p in ports}
+    for identity, profile in cfg["esp_devices"].items():
+        if identity == "default" or identity in detected.values():
+            continue
+        port = profile["esp"]["serial_port"]
+        profile["esp"]["last_error"] = ("当前未连接" if port not in connected else
+            "当前串口连接的是另一台 ESP" if port in detected else "串口未响应")
+        profile["esp"]["last_checked_at"] = int(time.time() * 1000)
+    if len(detected) == 1:
+        cfg["active_esp_id"] = next(iter(detected.values()))
+    elif original in cfg["esp_devices"]:
+        cfg["active_esp_id"] = original
+    ensure_esp_profiles(cfg)
+    write_json(CONFIG_FILE, cfg)
+    return {"ok": len(detected) == 1, "multiple_devices": len(detected) > 1,
+            "results": results, "message": "检测到多台 ESP，请只保留一台再写入" if len(detected) > 1 else
+            "已选择当前 ESP" if detected else "没有检测到 USB ESP，可选择已保存档案使用 HTTP"}
+
+
+def prepare_esp_write(cfg=None):
+    """锁定已选设备；换机必须重新检测，绝不把旧配置写到新设备。"""
+    desired = cfg or read_config()
+    ensure_active_esp_selected(desired)
+    identity = desired["active_esp_id"]
+    selected_port = desired["esp"]["serial_port"]
+    detected = []
+    for item in list_serial_ports():
+        result = serial_json_command(item["port"], {"cmd": "status"}, '"ok"', 3000)
+        body = result.get("json")
+        if result["ok"] and isinstance(body, dict) and body.get("ok") is True and esp_id_from_status(body) != "default":
+            detected.append((item["port"], body))
+    if len(detected) > 1:
+        raise RuntimeError("检测到多台 ESP 同时连接，请只保留当前要配置的一台")
+    if detected:
+        port, body = detected[0]
+        if esp_id_from_status(body) != identity or (selected_port and port != selected_port):
+            raise RuntimeError("USB ESP 身份或串口已改变，请重新检测设备后再配置，未写入任何数据")
+        actual = apply_status_to_config(body, port)
+    else:
+        host = normalize_esp_host(desired["esp"]["host"] or desired["esp"]["last_ip"])
+        if not host:
+            raise RuntimeError("当前 ESP USB 未响应且没有已确认的 HTTP 地址")
+        result = local_request("http://{}:{}/api/status".format(host, desired["esp"]["port"]), timeout_ms=1500)
+        if not is_usable_esp_status(result) or esp_id_from_status(result["json"]) != identity:
+            raise RuntimeError("HTTP 地址的 ESP 身份未通过校验，已阻止写入")
+        actual = apply_status_to_config(result["json"], selected_port, host)
+    actual["esp"]["port"] = desired["esp"]["port"]
+    for key in ("wifi", "printer", "display"):
+        actual[key] = merge_config(DEFAULT_CONFIG[key], desired[key])
+    return save_config(actual)
 
 
 def read_esp_status_via_serial(port):
     cfg = read_config()
     serial_port = normalize_serial_port(port or cfg["esp"]["serial_port"])
     result = serial_json_command(serial_port, {"cmd": "status"}, '"ok"', 9000)
-    if not result["ok"]:
-        return {"ok": False, "port": serial_port, "error": result.get("error") or "USB 串口没有响应"}
+    if not result["ok"] or not isinstance(result.get("json"), dict) or result["json"].get("ok") is not True:
+        return {"ok": False, "port": serial_port, "error": result.get("error") or "USB ESP 未响应"}
     cfg = apply_status_to_config(result["json"], serial_port, "")
-    return {"ok": True, "port": serial_port, "status": result["json"], "esp": cfg["esp"]}
+    return {"ok": True, "port": serial_port, "status": result["json"], "esp": cfg["esp"], "active_esp_id": cfg["active_esp_id"]}
 
 
 def rssi_to_signal(rssi):
@@ -696,7 +583,12 @@ def list_wifi_networks(port):
     http_result = list_esp_wifi_via_http(cfg)
     if http_result["ok"]:
         return http_result
-    return list_esp_wifi_via_serial(port)
+    serial_result = list_esp_wifi_via_serial(port)
+    if serial_result["ok"]:
+        return serial_result
+    pc_result = list_pc_wifi_networks()
+    pc_result["message"] = "{}；{}；{}".format(http_result["message"], serial_result["message"], pc_result["message"])
+    return pc_result
 
 
 def saved_devices():
@@ -720,130 +612,136 @@ def compact_printers_for_esp(devices):
     return out
 
 
-def sync_printer_list_to_esp(devices, cfg=None):
-    """把精简打印机列表推送到 ESP 本地网页：串口优先，HTTP 兜底。"""
-    cfg = cfg or read_config()
-    host = normalize_esp_host(cfg["esp"]["host"] or cfg["esp"]["last_ip"])
+def sync_printer_list_to_esp(devices, cfg=None, verified=False):
     printers = compact_printers_for_esp(devices)
     if not printers:
         return {"ok": False, "skipped": True, "reason": "没有可同步的打印机"}
-    serial_error = "USB 串口未连接"
-    serial_payload = {"printers": printers}
-    if len(json.dumps(serial_payload).encode("utf-8")) <= 1900:
-        serial_port = normalize_serial_port(cfg["esp"]["serial_port"])
-        if serial_port in [p["port"] for p in list_serial_ports()]:
-            serial_result = push_config_to_serial(serial_port, serial_payload)
-            if serial_result["status"]:
-                return {"ok": True, "transport": "serial", "count": len(printers)}
-            serial_error = serial_result.get("error") or "ESP 未确认打印机列表"
-    else:
-        serial_error = "打印机列表超过串口单次写入长度"
+    try:
+        cfg = cfg if verified else prepare_esp_write(cfg)
+    except RuntimeError as error:
+        return {"ok": False, "skipped": True, "reason": str(error)}
+    payload = {"printers": printers}
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    serial_error = "打印机列表超过串口单次写入长度"
+    if len(encoded.encode("utf-8")) <= 1900:
+        result = push_config_to_serial(cfg["esp"]["serial_port"], payload)
+        if result["status"]:
+            return {"ok": True, "transport": "serial", "count": len(printers), "target_esp_id": cfg["active_esp_id"]}
+        serial_error = result.get("error")
+    host = normalize_esp_host(cfg["esp"]["host"] or cfg["esp"]["last_ip"])
     if not host:
-        return {"ok": False, "skipped": True, "reason": "没有 ESP 地址", "serial_error": serial_error}
+        return {"ok": False, "serial_error": serial_error, "error": "没有 ESP HTTP 地址"}
     from urllib.parse import urlencode
-    params = urlencode({"printers_json": json.dumps({"printers": printers})})
-    url = "http://{}:{}/api/printers-url?{}".format(host, int(cfg["esp"]["port"] or 8081), params)
-    result = local_request(url, "GET", None, 2000)
-    ok = 200 <= result.get("status", 0) < 300
-    return {"ok": ok, "transport": "http", "host": host, "count": len(printers),
-            "status": result.get("status", 0), "serial_error": serial_error}
+    url = "http://{}:{}/api/printers-url?{}".format(host, cfg["esp"]["port"], urlencode({"printers_json": encoded}))
+    result = local_request(url, timeout_ms=2000)
+    return {"ok": 200 <= result.get("status", 0) < 300, "transport": "http", "count": len(printers),
+            "serial_error": serial_error, "status": result.get("status", 0), "error": result.get("error"),
+            "target_esp_id": cfg["active_esp_id"]}
+
+
+def display_payload(cfg):
+    display = cfg["display"]
+    return {"brightness": normalize_brightness(display["brightness"]),
+            "layout": normalize_layout(display["layout"]), "alias": normalize_alias(display["alias"]),
+            "alias_bitmap_hex": display["alias_bitmap_hex"],
+            "alias_bitmap_w": display["alias_bitmap_w"], "alias_bitmap_h": display["alias_bitmap_h"]}
+
+
+def write_esp_payload(cfg, payload):
+    result = push_config_to_serial(cfg["esp"]["serial_port"], payload)
+    target = {"target_esp_id": cfg["active_esp_id"], "target_serial_port": cfg["esp"]["serial_port"],
+              "target_host": cfg["esp"]["host"]}
+    if result["status"]:
+        return {"ok": True, "transport": "serial", **target}
+    if cfg["esp"]["host"]:
+        http_result = local_request(esp_config_url(payload, cfg), timeout_ms=1500)
+        if 200 <= http_result.get("status", 0) < 300:
+            return {"ok": True, "transport": "http", **target}
+        return {"ok": False, "serial_error": result.get("error"), "http_error": http_result.get("error") or
+                "HTTP {}".format(http_result.get("status", 0)), **target}
+    return {"ok": False, "serial_error": result.get("error"), **target}
 
 
 def push_config_to_esp(cfg=None):
-    """写入完整云 MQTT 配置：串口优先，HTTP 兜底。"""
-    cfg = cfg or read_config()
+    cfg = prepare_esp_write(cfg)
     if not cfg["cloud"]["access_token"]:
         raise RuntimeError("尚未登录 Bambu 云服务")
     if not cfg["printer"]["serial"]:
         raise RuntimeError("尚未选择打印机")
     if not cfg["wifi"]["ssid"] or not cfg["wifi"]["password"]:
-        raise RuntimeError("尚未配置 WiFi，请先完成 WiFi 步骤。")
+        raise RuntimeError("请先配置 WiFi")
     username = cfg["cloud"]["mqtt_username"] or refresh_mqtt_username()
     if not username:
-        raise RuntimeError("没有获取到 MQTT 用户名，请重新登录 Bambu 云服务")
-    payload = {
-        "wifi_ssid": cfg["wifi"]["ssid"],
-        "wifi_password": cfg["wifi"]["password"],
-        "region": cfg["cloud"]["region"],
-        "mqtt_host": mqtt_host(cfg["cloud"]["region"]),
-        "mqtt_username": username,
-        "token": cfg["cloud"]["access_token"],
-        "serial": cfg["printer"]["serial"],
-        "name": cfg["printer"]["display_name"] or cfg["printer"]["serial"],
-        "brightness": normalize_brightness(cfg["display"]["brightness"]),
-    }
-    serial_result = push_config_to_serial(cfg["esp"]["serial_port"], payload)
-    if serial_result["status"]:
-        printer_sync = sync_printer_list_to_esp(saved_devices(), cfg)
-        return {"ok": True, "transport": "serial", "printer_sync": printer_sync, **serial_result}
-    if cfg["esp"]["host"]:
-        http_result = local_request(esp_config_url(payload, cfg), "GET", None, 1500)
-        if 200 <= http_result.get("status", 0) < 300:
-            printer_sync = sync_printer_list_to_esp(saved_devices(), cfg)
-            return {"ok": True, "transport": "http", "printer_sync": printer_sync, **http_result}
-        return {"ok": False, "transport": "failed", "serial_error": serial_result.get("error"),
-                "http_error": "ESP HTTP 写入失败"}
-    return {"ok": False, "transport": "failed", "serial_error": serial_result.get("error")}
+        raise RuntimeError("没有获取到 MQTT 用户名，请重新登录")
+    payload = {"wifi_ssid": cfg["wifi"]["ssid"], "wifi_password": cfg["wifi"]["password"],
+               "region": cfg["cloud"]["region"], "mqtt_host": mqtt_host(cfg["cloud"]["region"]),
+               "mqtt_username": username, "token": cfg["cloud"]["access_token"],
+               "serial": cfg["printer"]["serial"], "name": cfg["printer"]["display_name"] or cfg["printer"]["serial"],
+               "model": cfg["printer"]["model"], **display_payload(cfg)}
+    result = write_esp_payload(cfg, payload)
+    if result["ok"]:
+        result["printer_sync"] = sync_printer_list_to_esp(saved_devices(), cfg, verified=True)
+    return result
 
 
 def push_wifi_to_esp(cfg=None):
-    cfg = cfg or read_config()
+    cfg = prepare_esp_write(cfg)
     if not cfg["wifi"]["ssid"] or not cfg["wifi"]["password"]:
         raise RuntimeError("请填写 WiFi 名称和密码")
-    payload = {
-        "wifi_ssid": cfg["wifi"]["ssid"],
-        "wifi_password": cfg["wifi"]["password"],
-        "brightness": normalize_brightness(cfg["display"]["brightness"]),
-    }
-    serial_result = push_config_to_serial(cfg["esp"]["serial_port"], payload)
-    if serial_result["status"]:
-        return {"ok": True, "transport": "serial", **serial_result}
-    if cfg["esp"]["host"]:
-        http_result = local_request(esp_config_url(payload, cfg), "GET", None, 1500)
-        if 200 <= http_result.get("status", 0) < 300:
-            return {"ok": True, "transport": "http", **http_result}
-        return {"ok": False, "transport": "failed", "serial_error": serial_result.get("error"),
-                "http_error": "ESP HTTP 写入失败"}
-    return {"ok": False, "transport": "failed", "serial_error": serial_result.get("error")}
+    return write_esp_payload(cfg, {"wifi_ssid": cfg["wifi"]["ssid"], "wifi_password": cfg["wifi"]["password"],
+                                   "brightness": normalize_brightness(cfg["display"]["brightness"])})
 
 
-def push_brightness_to_esp(cfg=None):
-    cfg = cfg or read_config()
-    payload = {"brightness": normalize_brightness(cfg["display"]["brightness"])}
-    serial_result = push_config_to_serial(cfg["esp"]["serial_port"], payload)
-    if serial_result["status"]:
-        return {"ok": True, "transport": "serial", **serial_result}
-    if cfg["esp"]["host"]:
-        http_result = local_request(esp_config_url(payload, cfg), "GET", None, 1500)
-        if 200 <= http_result.get("status", 0) < 300:
-            return {"ok": True, "transport": "http", **http_result}
-        return {"ok": False, "transport": "failed", "serial_error": serial_result.get("error"),
-                "http_error": http_result.get("error") or "HTTP {}".format(http_result.get("status", 0))}
-    return {"ok": False, "transport": "failed", "serial_error": serial_result.get("error")}
+def push_display_to_esp(cfg=None):
+    cfg = prepare_esp_write(cfg)
+    return write_esp_payload(cfg, display_payload(cfg))
 
 
-def check_esp_status():
+def configure_wifi_and_detect(cfg):
+    write = push_config_to_esp(cfg) if cfg["cloud"]["access_token"] and cfg["printer"]["serial"] else push_wifi_to_esp(cfg)
+    if write["ok"]:
+        time.sleep(3.5 if write["transport"] == "serial" else 1.2)
+    return {"ok": write["ok"], "write": write, "detection": check_esp_status(discover=True)}
+
+
+def scan_for_esp(port):
+    def probe(host):
+        result = local_request("http://{}:{}/api/status".format(host, port), timeout_ms=350)
+        return (host, result) if is_usable_esp_status(result) else None
+    for prefix in local_lan_prefixes():
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            for found in pool.map(probe, ("{}.{}".format(prefix, i) for i in range(1, 255))):
+                if found:
+                    return found
+    return None
+
+
+def check_esp_status(discover=False):
     cfg = read_config()
-    port = int(cfg["esp"]["port"] or 8081)
+    port = cfg["esp"]["port"]
     if cfg["esp"]["host"]:
-        result = local_request("http://{}:{}/api/status".format(cfg["esp"]["host"], port), "GET", None, 1200)
+        result = local_request("http://{}:{}/api/status".format(cfg["esp"]["host"], port), timeout_ms=1200)
         if is_usable_esp_status(result):
             apply_status_to_config(result["json"], cfg["esp"]["serial_port"], cfg["esp"]["host"])
-            ip = normalize_esp_host((result["json"] or {}).get("ip"))
-            return {"ok": bool(ip), "source": "http",
-                    "message": "ESP 已通过 HTTP 检测到 WiFi IP：{}".format(ip) if ip
-                    else "ESP HTTP 已响应，但还没有连上 WiFi。"}
-    # USB 串口兜底
-    serial_port = cfg["esp"]["serial_port"]
-    result = serial_json_command(serial_port, {"cmd": "status"}, '"ok"', 9000)
-    if not result["ok"]:
-        return {"ok": False, "source": "serial", "error": result.get("error") or "USB 串口没有响应",
-                "message": result.get("error") or "USB 串口没有响应"}
-    apply_status_to_config(result["json"], serial_port, "")
-    ip = normalize_esp_host((result["json"] or {}).get("ip"))
-    return {"ok": bool(ip), "source": "serial",
-            "message": "ESP 已通过 USB 检测到 WiFi IP：{}".format(ip) if ip
-            else "ESP USB 可通信，但还没有连上 WiFi。请确认 WiFi 名称和密码，等待 10-20 秒后再检测。"}
+            ip = normalize_esp_host(result["json"].get("ip"))
+            return {"ok": bool(ip), "source": "http", "status": result["json"],
+                    "message": "ESP WiFi IP：" + ip if ip else "ESP HTTP 已响应，但未连接 WiFi"}
+    result = read_esp_status_via_serial(cfg["esp"]["serial_port"])
+    if result["ok"]:
+        ip = normalize_esp_host(result["status"].get("ip"))
+        return {"ok": bool(ip), "source": "serial", "status": result["status"],
+                "message": "ESP WiFi IP：" + ip if ip else "ESP USB 可通信，但未连接 WiFi；请检查密码并稍后重试"}
+    if discover:
+        found = scan_for_esp(port)
+        if found:
+            host, response = found
+            apply_status_to_config(response["json"], "", host)
+            return {"ok": bool(normalize_esp_host(response["json"].get("ip"))), "source": "discover",
+                    "status": response["json"], "message": "局域网找到 ESP：" + host}
+    cfg["esp"]["wifi_status"] = "unknown"
+    cfg["esp"]["last_error"] = result.get("error") or "没有检测到 ESP"
+    save_config(cfg)
+    return {"ok": False, "message": cfg["esp"]["last_error"]}
 
 
 # ---------------------------------------------------------------------------
@@ -851,20 +749,13 @@ def check_esp_status():
 # ---------------------------------------------------------------------------
 
 def prompt(text, default=""):
-    suffix = "（{}）".format(default) if default else ""
-    try:
-        value = input("{}{}: ".format(text, suffix)).strip()
-    except EOFError:
-        return default
-    return value or default
+    suffix = "（{}）".format(default) if default != "" else ""
+    return input("{}{}: ".format(text, suffix)).strip() or default
 
 
 def prompt_password(text):
     import getpass
-    try:
-        return getpass.getpass("{}: ".format(text)).strip()
-    except (EOFError, Exception):
-        return input("{}: ".format(text)).strip()
+    return getpass.getpass("{}: ".format(text))
 
 
 def pause():
@@ -884,20 +775,27 @@ def banner():
     print("-" * 60)
     print("  云账号: {} ({})   串口: {}".format(cfg["cloud"]["account"] or "--", logged, cfg["esp"]["serial_port"] or "--"))
     print("  WiFi: {}   打印机: {}   ESP地址: {}".format(wifi, printer, cfg["esp"]["host"] or "--"))
+    print("  当前设备:", esp_label(cfg["esp_devices"].get(cfg["active_esp_id"])))
+    print("  屏幕: {} / {}%".format(cfg["display"]["layout"], cfg["display"]["brightness"]))
     print("=" * 60)
 
 
 MENU = """
   1) Bambu 云登录（发送验证码 / 验证码登录）
-  2) 检测当前 ESP（读取串口身份）
+  2) 自动检测当前 ESP / 热插拔识别
   3) 选择串口
   4) 扫描附近 WiFi
   5) 设置 WiFi 并写入 ESP
   6) 刷新打印机列表
   7) 选择打印机并写入云配置
-  8) 设置屏幕亮度
+  8) 屏幕设置（0-100 亮度 / 经典或信息面板 / 别名）
   9) 检测 ESP WiFi 状态
  10) 同步打印机列表到 ESP 本地网页
+ 11) 已保存 ESP 档案 / 切换设备
+ 12) 高级 HTTP 地址与端口 / 只保存设置
+ 13) 同步完整云配置到 ESP
+ 14) 查看当前配置（隐藏密码和 token）
+ 15) 读取所选串口 ESP 身份
   0) 退出
 """
 
@@ -931,20 +829,20 @@ def action_login():
 
 
 def action_detect_esp():
-    cfg = read_config()
-    print("→ 正在通过串口 {} 读取 ESP 身份...".format(cfg["esp"]["serial_port"] or "（未选择）"))
-    result = read_esp_status_via_serial(cfg["esp"]["serial_port"])
-    if not result["ok"]:
-        print("! 检测失败:", result.get("error"))
-        return
-    status = result["status"] or {}
-    print("✓ ESP 已响应。")
-    print("   MAC:", status.get("mac", "--"), " chip:", status.get("chip_id", "--"))
-    ip = normalize_esp_host(status.get("ip"))
-    print("   WiFi:", "已连，IP " + ip if ip else "未连上 WiFi")
+    print("→ 正在扫描串口 ESP...")
+    result = auto_detect_esp_ports()
+    print(result["message"])
+    for item in result["results"]:
+        print("  {}: {}".format(item["port"], item.get("id") or item.get("error")))
 
-    if prompt("查看 ESP 返回的完整原始数据？y/n", "n").lower().startswith("y"):
-        print(json.dumps(status, ensure_ascii=False, indent=2))
+
+def action_read_device():
+    result = read_esp_status_via_serial(read_config()["esp"]["serial_port"])
+    if not result["ok"]:
+        print("!", result.get("error"))
+        return
+    status = result["status"]
+    print("设备:", result["active_esp_id"], "MAC:", status.get("mac", "--"), "IP:", status.get("ip") or "未联网")
 
 
 def action_choose_serial():
@@ -983,6 +881,7 @@ def action_scan_wifi():
 
 def action_set_wifi():
     cfg = read_config()
+    ensure_active_esp_selected(cfg)
     ssid = prompt("WiFi 名称(SSID)", cfg["wifi"]["ssid"])
     if not ssid:
         print("! 未填写 SSID"); return
@@ -994,16 +893,13 @@ def action_set_wifi():
         print("✓ 已保存 WiFi 设置（未写入）。"); return
     print("→ 正在写入 ESP...")
     try:
-        result = push_wifi_to_esp(read_config())
+        result = configure_wifi_and_detect(read_config())
     except Exception as err:
         print("! 写入失败:", err); return
-    if result["ok"]:
-        print("✓ WiFi 已通过 {} 写入。".format("USB 串口" if result["transport"] == "serial" else "ESP HTTP"))
-        time.sleep(3.5 if result["transport"] == "serial" else 1.2)
-        status = check_esp_status()
-        print("   状态:", status.get("message"))
-    else:
-        print("! 写入失败:", result.get("serial_error") or result.get("http_error"))
+    write = result["write"]
+    print("✓ WiFi 已通过 {} 写入".format(write["transport"]) if write["ok"] else
+          "! 写入失败: " + str(write.get("serial_error") or write.get("http_error")))
+    print("联网状态:", result["detection"].get("message"))
 
 
 def action_refresh_printers():
@@ -1017,17 +913,11 @@ def action_refresh_printers():
     for idx, d in enumerate(devices, 1):
         print("  {}) {}  型号:{}  序列号:{}  {}".format(
             idx, d["display_name"], d["model"], d["serial"], d.get("print_status") or ""))
-    # 顺带把打印机列表同步到 ESP 本地网页（串口优先，HTTP 兜底）
-    sync = sync_printer_list_to_esp(devices, read_config())
-    if sync.get("ok"):
-        print("✓ 已通过 {} 同步打印机列表到 ESP 本地网页。".format(
-            "USB 串口" if sync.get("transport") == "serial" else "ESP HTTP"))
-    elif not sync.get("skipped"):
-        print("! 打印机列表未能同步到 ESP:", sync.get("serial_error") or sync.get("reason") or "")
 
 
 def action_select_printer():
     cfg = read_config()
+    ensure_active_esp_selected(cfg)
     if not cfg["cloud"]["access_token"]:
         print("! 请先登录 Bambu 云。"); return
     if not (cfg["wifi"]["ssid"] and cfg["wifi"]["password"]):
@@ -1042,7 +932,6 @@ def action_select_printer():
     if not choice.isdigit() or not (1 <= int(choice) <= len(devices)):
         print("! 选择无效"); return
     device = devices[int(choice) - 1]
-    cfg = read_config()
     cfg["printer"]["serial"] = device["serial"]
     cfg["printer"]["access_code"] = device.get("access_code") or cfg["printer"]["access_code"]
     cfg["printer"]["display_name"] = device["display_name"] or device["serial"]
@@ -1080,30 +969,129 @@ def action_sync_printers():
               or "请确认 ESP 已连接 USB 串口，或先检测到 ESP 的局域网地址。")
 
 
-def action_set_brightness():
+def action_set_display():
     cfg = read_config()
-    print("当前亮度:", cfg["display"]["brightness"], "%")
-    value = prompt("设置屏幕亮度 25/50/75/100", str(cfg["display"]["brightness"]))
-    cfg["display"]["brightness"] = normalize_brightness(value)
+    ensure_active_esp_selected(cfg)
+    value = prompt("亮度 0-100（0 为关闭背光）", str(cfg["display"]["brightness"]))
+    level = float(value)
+    if not 0 <= level <= 100:
+        raise ValueError("亮度必须是 0-100")
+    layout = prompt("布局 classic=经典 / dashboard=信息面板", cfg["display"]["layout"])
+    if layout not in ("classic", "dashboard"):
+        raise ValueError("布局必须是 classic 或 dashboard")
+    cfg["display"]["brightness"] = normalize_brightness(level)
+    cfg["display"]["layout"] = layout
+    print("当前别名:", cfg["display"]["alias"] or "（空）", "；最新信息面板已隐藏别名，此设置保留协议兼容")
+    alias = prompt("别名（留空保留，输入 - 清空）", cfg["display"]["alias"])
+    alias = "" if alias == "-" else normalize_alias(alias)
+    if alias != cfg["display"]["alias"] or (alias and not cfg["display"]["alias_bitmap_hex"]):
+        cfg["display"].update(render_alias_bitmap(alias))
     save_config(cfg)
-    if not prompt("是否立即写入 ESP？y/n", "y").lower().startswith("y"):
-        print("✓ 已保存亮度:", cfg["display"]["brightness"], "%"); return
-    print("→ 正在写入亮度...")
-    try:
-        result = push_brightness_to_esp(read_config())
-    except Exception as err:
-        print("! 写入失败:", err); return
-    print("✓ 已写入。" if result["ok"] else "! 写入失败: " + str(result.get("serial_error") or result.get("http_error")))
+    if prompt("立即写入 ESP？y/n", "y").lower().startswith("y"):
+        print_write_result(push_display_to_esp(cfg))
+    else:
+        print("已保存屏幕设置，未写入 ESP")
+
+
+def print_write_result(result):
+    if result["ok"]:
+        print("✓ 已通过 {} 写入 {}".format(result["transport"], result["target_esp_id"]))
+        sync = result.get("printer_sync")
+        if sync and not sync["ok"]:
+            print("! 打印机列表未同步:", sync.get("reason") or sync.get("serial_error") or sync.get("error"))
+    else:
+        print("! 写入失败:", result.get("serial_error") or result.get("http_error"))
+
+
+def action_profiles():
+    cfg = read_config()
+    profiles = sorted((p for p in cfg["esp_devices"].values() if p["id"] != "default"),
+                      key=lambda p: (p["esp"]["serial_port"], p["id"]))
+    for index, profile in enumerate(profiles, 1):
+        print("{}{}) {}".format("*" if profile["id"] == cfg["active_esp_id"] else " ", index, esp_label(profile)))
+    if not profiles:
+        print("没有已保存的 ESP 档案，请先检测设备"); return
+    choice = prompt("选择档案编号（留空取消）")
+    if choice.isdigit() and 1 <= int(choice) <= len(profiles):
+        activate_esp_profile(profiles[int(choice) - 1]["id"])
+        print("已切换档案；写入前仍会验证物理设备身份")
+
+
+def action_http_settings():
+    cfg = read_config()
+    ensure_active_esp_selected(cfg)
+    host = prompt("ESP 地址（- 清空）", cfg["esp"]["host"])
+    host = "" if host == "-" else host
+    if host and not normalize_esp_host(host):
+        raise ValueError("请输入局域网 IPv4 或主机名")
+    port = int(prompt("ESP HTTP 端口", str(cfg["esp"]["port"])))
+    if not 1 <= port <= 65535:
+        raise ValueError("端口必须是 1-65535")
+    cfg["esp"].update(host=normalize_esp_host(host), port=port)
+    save_config(cfg)
+    print("已保存，未写入 ESP；使用 HTTP 前会验证设备身份")
+
+
+def action_push_config():
+    print_write_result(push_config_to_esp())
+
+
+def action_show_config():
+    cfg = read_config()
+    public = {key: cfg[key] for key in ("active_esp_id", "printer", "display", "esp")}
+    public["printer"] = {k: v for k, v in cfg["printer"].items() if k != "access_code"}
+    public["display"] = {k: v for k, v in cfg["display"].items() if not k.startswith("alias_bitmap")}
+    public["wifi"] = {"ssid": cfg["wifi"]["ssid"], "password_saved": bool(cfg["wifi"]["password"])}
+    public["cloud"] = {"region": cfg["cloud"]["region"], "account": cfg["cloud"]["account"],
+                       "logged_in": bool(cfg["cloud"]["access_token"])}
+    public["version"] = BACKEND_VERSION
+    print(json.dumps(public, ensure_ascii=False, indent=2))
 
 
 def action_check_wifi_status():
     print("→ 正在检测 ESP WiFi 状态...")
-    status = check_esp_status()
+    status = check_esp_status(discover=True)
     print(("✓ " if status["ok"] else "! ") + (status.get("message") or status.get("error") or "状态未知"))
 
 
+def menu_prompt():
+    """Detect hotplug only while idle; never run a serial job during an action."""
+    if not sys.stdin.isatty():
+        return prompt("请选择操作")
+    print("请选择操作: ", end="", flush=True)
+    signature = tuple(p["port"] for p in list_serial_ports())
+    checked_at = time.monotonic()
+    identity = read_config()["active_esp_id"]
+    while True:
+        if sys.platform == "win32":
+            import msvcrt
+            if msvcrt.kbhit():
+                return input().strip()
+            time.sleep(0.1)
+        else:
+            import select
+            if select.select([sys.stdin], [], [], 1)[0]:
+                return input().strip()
+        if time.monotonic() - checked_at >= 8:
+            current = tuple(p["port"] for p in list_serial_ports())
+            result = auto_detect_esp_ports()
+            active = read_config()["active_esp_id"]
+            if current != signature or active != identity or result["multiple_devices"]:
+                print("\n" + result["message"])
+                print("请选择操作: ", end="", flush=True)
+            signature, identity = current, active
+            checked_at = time.monotonic()
+
+
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="PrintSphere Lite v0.4.71 跨平台配置工具")
+    parser.add_argument("--version", action="version", version=BACKEND_VERSION)
+    parser.parse_args()
     ensure_data()
+    if sys.stdin.isatty():
+        print("正在自动识别 USB ESP...")
+        print(auto_detect_esp_ports()["message"])
     actions = {
         "1": action_login,
         "2": action_detect_esp,
@@ -1112,14 +1100,19 @@ def main():
         "5": action_set_wifi,
         "6": action_refresh_printers,
         "7": action_select_printer,
-        "8": action_set_brightness,
+        "8": action_set_display,
         "9": action_check_wifi_status,
         "10": action_sync_printers,
+        "11": action_profiles,
+        "12": action_http_settings,
+        "13": action_push_config,
+        "14": action_show_config,
+        "15": action_read_device,
     }
     while True:
         banner()
         print(MENU)
-        choice = prompt("请选择操作", "")
+        choice = menu_prompt()
         if choice == "0":
             print("再见。")
             return
@@ -1140,5 +1133,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         print("\n已退出。")
